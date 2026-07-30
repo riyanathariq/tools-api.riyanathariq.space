@@ -14,6 +14,8 @@ services:
       - COOKIE_SECURE=true
     volumes:
       - tools-api-data:/data
+    # distroless nonroot uid/gid = 65532; volume must be writable by that user
+    user: "65532:65532"
     pull_policy: always
 
 volumes:
