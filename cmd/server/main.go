@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/config"
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/httpapi"
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/ratelimit"
+	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/webhook"
 )
 
 func main() {
@@ -39,8 +41,18 @@ func main() {
 		log,
 	)
 
+	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+		log.Error("data dir", "err", err)
+		os.Exit(1)
+	}
+	hooks, err := webhook.Open(filepath.Join(cfg.DataDir, "webhook"))
+	if err != nil {
+		log.Error("webhook store", "err", err)
+		os.Exit(1)
+	}
+
 	limiter := ratelimit.New()
-	handler := httpapi.New(cfg, log, google, sessions, limiter)
+	handler := httpapi.New(cfg, log, google, sessions, limiter, hooks)
 	server := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           handler,

@@ -9,8 +9,8 @@ Local browser tools stay in the Next.js app. This service handles login-gated se
 | Phase | Status | Feature |
 |-------|--------|---------|
 | 1 | done | Google OAuth + session cookie (`/auth/*`) |
-| 2 | **in progress** | SMTP Tester (BYO SMTP) |
-| 3 | pending | Webhook Bin |
+| 2 | done | SMTP Tester (BYO SMTP) |
+| 3 | done | Webhook Bin (`/hook/{id}` + `/api/cloud/webhook/*`) |
 
 ## Auth endpoints (Phase 1)
 
@@ -24,6 +24,28 @@ Local browser tools stay in the Next.js app. This service handles login-gated se
 | GET | `/auth/me` | Current user (401 if logged out) |
 | POST | `/auth/logout` | Clear session cookie |
 | POST | `/api/cloud/smtp/test` | BYO SMTP test send (**auth required**, 10/hour) |
+
+### Webhook Bin
+
+Public ingest (no auth):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| * | `/hook/{id}` | Capture request |
+| * | `/hook/{id}/{path...}` | Capture with trailing path |
+
+Management (**auth required**):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/cloud/webhook/bins` | List bins |
+| POST | `/api/cloud/webhook/bins` | Create bin (`{ name? }`) |
+| GET | `/api/cloud/webhook/bins/{id}` | Bin + hits |
+| DELETE | `/api/cloud/webhook/bins/{id}` | Delete bin |
+| DELETE | `/api/cloud/webhook/bins/{id}/hits` | Clear hits |
+| GET | `/api/cloud/webhook/bins/{id}/hits/{hitId}` | Hit detail |
+
+Limits: 3 bins/user, 100 hits/bin, 256 KiB body, 72h TTL. `Authorization` / `Cookie` headers redacted.
 
 Session cookie: `tools_session` (JWT HS256, HttpOnly, SameSite=Lax).
 

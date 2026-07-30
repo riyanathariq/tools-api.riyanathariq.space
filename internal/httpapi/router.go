@@ -9,6 +9,7 @@ import (
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/auth"
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/config"
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/ratelimit"
+	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/webhook"
 )
 
 type Server struct {
@@ -17,6 +18,7 @@ type Server struct {
 	google   *auth.GoogleAuth
 	sessions *auth.SessionManager
 	limiter  *ratelimit.Limiter
+	hooks    *webhook.Store
 	started  time.Time
 }
 
@@ -26,6 +28,7 @@ func New(
 	google *auth.GoogleAuth,
 	sessions *auth.SessionManager,
 	limiter *ratelimit.Limiter,
+	hooks *webhook.Store,
 ) http.Handler {
 	s := &Server{
 		cfg:      cfg,
@@ -33,6 +36,7 @@ func New(
 		google:   google,
 		sessions: sessions,
 		limiter:  limiter,
+		hooks:    hooks,
 		started:  time.Now().UTC(),
 	}
 
@@ -47,6 +51,18 @@ func New(
 	mux.HandleFunc("POST /auth/logout", s.google.Logout)
 
 	mux.Handle("POST /api/cloud/smtp/test", s.sessions.RequireUser(http.HandlerFunc(s.handleSMTPTest)))
+
+	mux.Handle("GET /api/cloud/webhook/bins", s.sessions.RequireUser(http.HandlerFunc(s.handleListBins)))
+	mux.Handle("POST /api/cloud/webhook/bins", s.sessions.RequireUser(http.HandlerFunc(s.handleCreateBin)))
+	mux.Handle("GET /api/cloud/webhook/bins/{id}", s.sessions.RequireUser(http.HandlerFunc(s.handleGetBin)))
+	mux.Handle("DELETE /api/cloud/webhook/bins/{id}", s.sessions.RequireUser(http.HandlerFunc(s.handleDeleteBin)))
+	mux.Handle("DELETE /api/cloud/webhook/bins/{id}/hits", s.sessions.RequireUser(http.HandlerFunc(s.handleClearHits)))
+	mux.Handle("GET /api/cloud/webhook/bins/{id}/hits", s.sessions.RequireUser(http.HandlerFunc(s.handleListHits)))
+	mux.Handle("GET /api/cloud/webhook/bins/{id}/hits/{hitId}", s.sessions.RequireUser(http.HandlerFunc(s.handleGetHit)))
+
+	// Public ingest — any method, optional trailing path.
+	mux.HandleFunc("/hook/{id}", s.handleHookIngest)
+	mux.HandleFunc("/hook/{id}/{path...}", s.handleHookIngest)
 
 	return chain(
 		mux,
