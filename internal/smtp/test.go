@@ -27,6 +27,7 @@ type Request struct {
 	To       string   `json:"to"`
 	Subject  string   `json:"subject"`
 	Text     string   `json:"text"`
+	HTML     bool     `json:"html"`
 }
 
 type Step struct {
@@ -94,12 +95,17 @@ func RunTest(req Request) Result {
 		return Result{OK: false, Steps: steps, Error: "Body too long (max 20000)"}
 	}
 
+	contentType := "text/plain; charset=UTF-8"
+	if req.HTML {
+		contentType = "text/html; charset=UTF-8"
+	}
+
 	msg := strings.Join([]string{
 		"From: " + from,
 		"To: " + to,
 		"Subject: " + subject,
 		"MIME-Version: 1.0",
-		"Content-Type: text/plain; charset=UTF-8",
+		"Content-Type: " + contentType,
 		"X-Mailer: tools-api.riyanathariq.space",
 		"",
 		body,
