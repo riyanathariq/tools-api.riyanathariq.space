@@ -1,0 +1,20 @@
+services:
+  api:
+    image: ${IMAGE:-ghcr.io/riyanathariq/tools-api.riyanathariq.space:latest}
+    container_name: tools-api-riyanathariq
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3003:3003"
+    env_file:
+      - .env
+    environment:
+      - APP_ENV=production
+      - HTTP_ADDR=:3003
+      - DATA_DIR=/data
+      - COOKIE_SECURE=true
+    volumes:
+      - tools-api-data:/data
+    pull_policy: always
+
+volumes:
+  tools-api-data:

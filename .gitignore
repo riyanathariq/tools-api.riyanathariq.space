@@ -1,0 +1,12 @@
+.bin/
+.dist/
+.data/
+*.exe
+*.test
+*.out
+.env
+.env.*
+!.env.example
+.DS_Store
+coverage.out
+vendor/
