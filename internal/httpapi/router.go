@@ -8,21 +8,32 @@ import (
 
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/auth"
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/config"
+	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/ratelimit"
 )
 
 type Server struct {
-	cfg     config.Config
-	log     *slog.Logger
-	google  *auth.GoogleAuth
-	started time.Time
+	cfg      config.Config
+	log      *slog.Logger
+	google   *auth.GoogleAuth
+	sessions *auth.SessionManager
+	limiter  *ratelimit.Limiter
+	started  time.Time
 }
 
-func New(cfg config.Config, log *slog.Logger, google *auth.GoogleAuth) http.Handler {
+func New(
+	cfg config.Config,
+	log *slog.Logger,
+	google *auth.GoogleAuth,
+	sessions *auth.SessionManager,
+	limiter *ratelimit.Limiter,
+) http.Handler {
 	s := &Server{
-		cfg:     cfg,
-		log:     log,
-		google:  google,
-		started: time.Now().UTC(),
+		cfg:      cfg,
+		log:      log,
+		google:   google,
+		sessions: sessions,
+		limiter:  limiter,
+		started:  time.Now().UTC(),
 	}
 
 	mux := http.NewServeMux()
@@ -34,6 +45,8 @@ func New(cfg config.Config, log *slog.Logger, google *auth.GoogleAuth) http.Hand
 	mux.HandleFunc("GET /auth/google/callback", s.google.Callback)
 	mux.HandleFunc("GET /auth/me", s.google.Me)
 	mux.HandleFunc("POST /auth/logout", s.google.Logout)
+
+	mux.Handle("POST /api/cloud/smtp/test", s.sessions.RequireUser(http.HandlerFunc(s.handleSMTPTest)))
 
 	return chain(
 		mux,
@@ -71,6 +84,7 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }

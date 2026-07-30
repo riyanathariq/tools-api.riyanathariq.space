@@ -15,6 +15,7 @@ import (
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/auth"
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/config"
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/httpapi"
+	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/ratelimit"
 )
 
 func main() {
@@ -38,13 +39,14 @@ func main() {
 		log,
 	)
 
-	handler := httpapi.New(cfg, log, google)
+	limiter := ratelimit.New()
+	handler := httpapi.New(cfg, log, google, sessions, limiter)
 	server := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		ReadTimeout:       20 * time.Second,
+		WriteTimeout:      45 * time.Second, // SMTP tests can take a while
 		IdleTimeout:       60 * time.Second,
 	}
 

@@ -8,8 +8,8 @@ Local browser tools stay in the Next.js app. This service handles login-gated se
 
 | Phase | Status | Feature |
 |-------|--------|---------|
-| 1 | **in progress** | Google OAuth + session cookie (`/auth/*`) |
-| 2 | pending | SMTP Tester (BYO SMTP) |
+| 1 | done | Google OAuth + session cookie (`/auth/*`) |
+| 2 | **in progress** | SMTP Tester (BYO SMTP) |
 | 3 | pending | Webhook Bin |
 
 ## Auth endpoints (Phase 1)
@@ -23,8 +23,27 @@ Local browser tools stay in the Next.js app. This service handles login-gated se
 | GET | `/auth/google/callback` | OAuth callback (sets HTTP-only cookie) |
 | GET | `/auth/me` | Current user (401 if logged out) |
 | POST | `/auth/logout` | Clear session cookie |
+| POST | `/api/cloud/smtp/test` | BYO SMTP test send (**auth required**, 10/hour) |
 
 Session cookie: `tools_session` (JWT HS256, HttpOnly, SameSite=Lax).
+
+### SMTP test body
+
+```json
+{
+  "host": "smtp.example.com",
+  "port": 587,
+  "security": "starttls",
+  "username": "user@example.com",
+  "password": "app-password",
+  "from": "user@example.com",
+  "to": "you@example.com",
+  "subject": "SMTP test",
+  "text": "hello"
+}
+```
+
+`security`: `starttls` | `ssl` | `none`. Password is never logged or stored.
 
 ## Local
 
