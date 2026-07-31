@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -70,10 +71,27 @@ type HitSummary struct {
 
 type Store struct {
 	pool *pgxpool.Pool
+	rdb  *redis.Client
 }
 
-func NewStore(pool *pgxpool.Pool) *Store {
-	return &Store{pool: pool}
+func NewStore(pool *pgxpool.Pool, rdb *redis.Client) *Store {
+	return &Store{pool: pool, rdb: rdb}
+}
+
+func binCacheKey(id string) string { return "bin:" + id }
+
+func (s *Store) cacheBin(ctx context.Context, id string, ttl time.Duration) {
+	if s.rdb == nil || ttl <= 0 {
+		return
+	}
+	_ = s.rdb.Set(ctx, binCacheKey(id), "1", ttl).Err()
+}
+
+func (s *Store) uncacheBin(ctx context.Context, id string) {
+	if s.rdb == nil {
+		return
+	}
+	_ = s.rdb.Del(ctx, binCacheKey(id)).Err()
 }
 
 func newID() (string, error) {
@@ -126,6 +144,7 @@ func (s *Store) Create(userID, name string) (*Bin, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.cacheBin(ctx, bin.ID, BinTTL)
 	return bin, nil
 }
 
@@ -170,6 +189,9 @@ func (s *Store) Delete(userID, binID string) error {
 		return err
 	}
 	_, err := s.pool.Exec(ctx, `DELETE FROM webhook_bins WHERE id = $1`, binID)
+	if err == nil {
+		s.uncacheBin(ctx, binID)
+	}
 	return err
 }
 
@@ -404,13 +426,24 @@ func (s *Store) GetHit(userID, binID, hitID string) (*Hit, error) {
 func (s *Store) PublicExists(binID string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+	if s.rdb != nil {
+		n, err := s.rdb.Exists(ctx, binCacheKey(binID)).Result()
+		if err == nil && n > 0 {
+			return true
+		}
+	}
 	_ = s.pruneExpired(ctx)
 	var expiresAt time.Time
 	err := s.pool.QueryRow(ctx, `SELECT expires_at FROM webhook_bins WHERE id = $1`, binID).Scan(&expiresAt)
 	if err != nil {
 		return false
 	}
-	return time.Now().UTC().Before(expiresAt)
+	if time.Now().UTC().After(expiresAt) {
+		s.uncacheBin(ctx, binID)
+		return false
+	}
+	s.cacheBin(ctx, binID, time.Until(expiresAt))
+	return true
 }
 
 func (s *Store) getOwned(ctx context.Context, userID, binID string) (*Bin, error) {
@@ -430,6 +463,7 @@ func (s *Store) getOwned(ctx context.Context, userID, binID string) (*Bin, error
 	}
 	if time.Now().UTC().After(b.ExpiresAt) {
 		_, _ = s.pool.Exec(ctx, `DELETE FROM webhook_bins WHERE id = $1`, binID)
+		s.uncacheBin(ctx, binID)
 		return nil, ErrExpired
 	}
 	return &b, nil
@@ -451,8 +485,18 @@ func scanBin(row scannable) (Bin, error) {
 }
 
 func (s *Store) pruneExpired(ctx context.Context) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM webhook_bins WHERE expires_at < NOW()`)
-	return err
+	rows, err := s.pool.Query(ctx, `DELETE FROM webhook_bins WHERE expires_at < NOW() RETURNING id`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			s.uncacheBin(ctx, id)
+		}
+	}
+	return rows.Err()
 }
 
 func redactHeaders(in map[string]string) map[string]string {

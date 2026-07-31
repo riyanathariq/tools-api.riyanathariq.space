@@ -23,7 +23,7 @@ func testStore(t *testing.T) *webhook.Store {
 		t.Skipf("postgres unavailable: %v", err)
 	}
 	t.Cleanup(pool.Close)
-	return webhook.NewStore(pool)
+	return webhook.NewStore(pool, nil)
 }
 
 func TestCreateIngestList(t *testing.T) {

@@ -17,6 +17,8 @@ import (
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/db"
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/httpapi"
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/ratelimit"
+	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/user"
+	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/visitor"
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/webhook"
 )
 
@@ -31,7 +33,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	bootCtx, bootCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	bootCtx, bootCancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer bootCancel()
 
 	pool, err := db.Connect(bootCtx, cfg.DatabaseURL)
@@ -48,6 +50,11 @@ func main() {
 	}
 	defer rdb.Close()
 
+	users := user.NewStore(pool)
+	visitors := visitor.NewStore(pool, rdb, log)
+	hooks := webhook.NewStore(pool, rdb)
+	limiter := ratelimit.New(rdb)
+
 	sessions := auth.NewSessionManager(cfg.SessionSecret, cfg.CookieName, cfg.CookieSecure, cfg.SessionTTL)
 	google := auth.NewGoogleAuth(
 		cfg.GoogleClientID,
@@ -55,12 +62,11 @@ func main() {
 		cfg.PublicBaseURL,
 		cfg.FrontendURL,
 		sessions,
+		users,
 		log,
 	)
 
-	hooks := webhook.NewStore(pool)
-	limiter := ratelimit.New(rdb)
-	handler := httpapi.New(cfg, log, google, sessions, limiter, hooks, pool, rdb)
+	handler := httpapi.New(cfg, log, google, sessions, limiter, hooks, users, visitors, pool, rdb)
 	server := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           handler,

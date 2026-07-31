@@ -13,6 +13,8 @@ import (
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/auth"
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/config"
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/ratelimit"
+	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/user"
+	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/visitor"
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/webhook"
 )
 
@@ -23,6 +25,8 @@ type Server struct {
 	sessions *auth.SessionManager
 	limiter  *ratelimit.Limiter
 	hooks    *webhook.Store
+	users    *user.Store
+	visitors *visitor.Store
 	pool     *pgxpool.Pool
 	rdb      *redis.Client
 	started  time.Time
@@ -35,6 +39,8 @@ func New(
 	sessions *auth.SessionManager,
 	limiter *ratelimit.Limiter,
 	hooks *webhook.Store,
+	users *user.Store,
+	visitors *visitor.Store,
 	pool *pgxpool.Pool,
 	rdb *redis.Client,
 ) http.Handler {
@@ -45,6 +51,8 @@ func New(
 		sessions: sessions,
 		limiter:  limiter,
 		hooks:    hooks,
+		users:    users,
+		visitors: visitors,
 		pool:     pool,
 		rdb:      rdb,
 		started:  time.Now().UTC(),
@@ -60,15 +68,17 @@ func New(
 	mux.HandleFunc("GET /auth/me", s.google.Me)
 	mux.HandleFunc("POST /auth/logout", s.google.Logout)
 
-	mux.Handle("POST /api/cloud/smtp/test", s.sessions.RequireUser(http.HandlerFunc(s.handleSMTPTest)))
+	mux.HandleFunc("POST /api/events/visitor", s.handleVisitorEvent)
 
-	mux.Handle("GET /api/cloud/webhook/bins", s.sessions.RequireUser(http.HandlerFunc(s.handleListBins)))
-	mux.Handle("POST /api/cloud/webhook/bins", s.sessions.RequireUser(http.HandlerFunc(s.handleCreateBin)))
-	mux.Handle("GET /api/cloud/webhook/bins/{id}", s.sessions.RequireUser(http.HandlerFunc(s.handleGetBin)))
-	mux.Handle("DELETE /api/cloud/webhook/bins/{id}", s.sessions.RequireUser(http.HandlerFunc(s.handleDeleteBin)))
-	mux.Handle("DELETE /api/cloud/webhook/bins/{id}/hits", s.sessions.RequireUser(http.HandlerFunc(s.handleClearHits)))
-	mux.Handle("GET /api/cloud/webhook/bins/{id}/hits", s.sessions.RequireUser(http.HandlerFunc(s.handleListHits)))
-	mux.Handle("GET /api/cloud/webhook/bins/{id}/hits/{hitId}", s.sessions.RequireUser(http.HandlerFunc(s.handleGetHit)))
+	mux.Handle("POST /api/cloud/smtp/test", s.RequireActiveUser(http.HandlerFunc(s.handleSMTPTest)))
+
+	mux.Handle("GET /api/cloud/webhook/bins", s.RequireActiveUser(http.HandlerFunc(s.handleListBins)))
+	mux.Handle("POST /api/cloud/webhook/bins", s.RequireActiveUser(http.HandlerFunc(s.handleCreateBin)))
+	mux.Handle("GET /api/cloud/webhook/bins/{id}", s.RequireActiveUser(http.HandlerFunc(s.handleGetBin)))
+	mux.Handle("DELETE /api/cloud/webhook/bins/{id}", s.RequireActiveUser(http.HandlerFunc(s.handleDeleteBin)))
+	mux.Handle("DELETE /api/cloud/webhook/bins/{id}/hits", s.RequireActiveUser(http.HandlerFunc(s.handleClearHits)))
+	mux.Handle("GET /api/cloud/webhook/bins/{id}/hits", s.RequireActiveUser(http.HandlerFunc(s.handleListHits)))
+	mux.Handle("GET /api/cloud/webhook/bins/{id}/hits/{hitId}", s.RequireActiveUser(http.HandlerFunc(s.handleGetHit)))
 
 	mux.HandleFunc("/hook/{id}", s.handleHookIngest)
 	mux.HandleFunc("/hook/{id}/{path...}", s.handleHookIngest)

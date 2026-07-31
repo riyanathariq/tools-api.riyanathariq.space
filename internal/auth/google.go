@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -16,6 +17,8 @@ import (
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+
+	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/user"
 )
 
 const (
@@ -26,12 +29,18 @@ const (
 type GoogleAuth struct {
 	cfg      *oauth2.Config
 	sessions *SessionManager
+	users    *user.Store
 	frontURL string
 	http     *http.Client
 	log      *slog.Logger
 }
 
-func NewGoogleAuth(clientID, clientSecret, publicBaseURL, frontendURL string, sessions *SessionManager, log *slog.Logger) *GoogleAuth {
+func NewGoogleAuth(
+	clientID, clientSecret, publicBaseURL, frontendURL string,
+	sessions *SessionManager,
+	users *user.Store,
+	log *slog.Logger,
+) *GoogleAuth {
 	redirect := strings.TrimRight(publicBaseURL, "/") + "/auth/google/callback"
 	if log == nil {
 		log = slog.Default()
@@ -45,6 +54,7 @@ func NewGoogleAuth(clientID, clientSecret, publicBaseURL, frontendURL string, se
 			Endpoint:     google.Endpoint,
 		},
 		sessions: sessions,
+		users:    users,
 		frontURL: strings.TrimRight(frontendURL, "/"),
 		http:     &http.Client{Timeout: 15 * time.Second},
 		log:      log,
@@ -111,14 +121,32 @@ func (g *GoogleAuth) Callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := g.fetchUser(r.Context(), tok.AccessToken)
+	profile, err := g.fetchUser(r.Context(), tok.AccessToken)
 	if err != nil {
 		g.log.Error("fetch google profile failed", "err", err)
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "failed to fetch profile"})
 		return
 	}
 
-	if err := g.sessions.Issue(w, *user); err != nil {
+	ip := requestIP(r)
+	if g.users != nil {
+		dbUser, err := g.users.UpsertLogin(r.Context(), profile.ID, profile.Email, profile.Name, profile.Picture, ip)
+		if errors.Is(err, user.ErrBanned) {
+			g.sessions.Clear(w)
+			g.clearCookie(w, oauthStateCookie)
+			g.clearCookie(w, oauthNextCookie)
+			http.Redirect(w, r, g.frontURL+"/?error="+url.QueryEscape("account_banned"), http.StatusFound)
+			return
+		}
+		if err != nil {
+			g.log.Error("user upsert failed", "err", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to persist user"})
+			return
+		}
+		_ = dbUser
+	}
+
+	if err := g.sessions.Issue(w, *profile); err != nil {
 		g.log.Error("session issue failed", "err", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to create session"})
 		return
@@ -131,6 +159,21 @@ func (g *GoogleAuth) Callback(w http.ResponseWriter, r *http.Request) {
 	g.clearCookie(w, oauthStateCookie)
 	g.clearCookie(w, oauthNextCookie)
 	http.Redirect(w, r, g.frontURL+next, http.StatusFound)
+}
+
+func requestIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		return strings.TrimSpace(parts[0])
+	}
+	if xr := r.Header.Get("X-Real-IP"); xr != "" {
+		return xr
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 func (g *GoogleAuth) Me(w http.ResponseWriter, r *http.Request) {

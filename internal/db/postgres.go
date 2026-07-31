@@ -2,43 +2,18 @@ package db
 
 import (
 	"context"
+	"database/sql"
+	"embed"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/pressly/goose/v3"
 )
 
-const schema = `
-CREATE TABLE IF NOT EXISTS webhook_bins (
-  id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  name TEXT NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL,
-  expires_at TIMESTAMPTZ NOT NULL,
-  hit_count INT NOT NULL DEFAULT 0,
-  last_hit_at TIMESTAMPTZ NULL
-);
-CREATE INDEX IF NOT EXISTS webhook_bins_user_id_idx ON webhook_bins (user_id);
-CREATE INDEX IF NOT EXISTS webhook_bins_expires_at_idx ON webhook_bins (expires_at);
-
-CREATE TABLE IF NOT EXISTS webhook_hits (
-  id TEXT PRIMARY KEY,
-  bin_id TEXT NOT NULL REFERENCES webhook_bins(id) ON DELETE CASCADE,
-  received_at TIMESTAMPTZ NOT NULL,
-  method TEXT NOT NULL,
-  path TEXT NOT NULL,
-  query TEXT NOT NULL DEFAULT '',
-  query_params JSONB NOT NULL DEFAULT '{}'::jsonb,
-  headers JSONB NOT NULL DEFAULT '{}'::jsonb,
-  content_type TEXT NOT NULL DEFAULT '',
-  body TEXT NOT NULL DEFAULT '',
-  body_truncated BOOLEAN NOT NULL DEFAULT FALSE,
-  body_bytes INT NOT NULL DEFAULT 0,
-  ip TEXT NOT NULL DEFAULT '',
-  user_agent TEXT NOT NULL DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS webhook_hits_bin_received_idx ON webhook_hits (bin_id, received_at DESC);
-`
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
 
 func Connect(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(databaseURL)
@@ -59,9 +34,28 @@ func Connect(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
-	if _, err := pool.Exec(ctx, schema); err != nil {
+	if err := migrate(pool); err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("migrate schema: %w", err)
+		return nil, err
 	}
 	return pool, nil
+}
+
+func migrate(pool *pgxpool.Pool) error {
+	sqlDB := stdlib.OpenDBFromPool(pool)
+	defer sqlDB.Close()
+
+	goose.SetBaseFS(migrationsFS)
+	if err := goose.SetDialect("postgres"); err != nil {
+		return fmt.Errorf("goose dialect: %w", err)
+	}
+	if err := goose.Up(sqlDB, "migrations"); err != nil {
+		return fmt.Errorf("goose up: %w", err)
+	}
+	return nil
+}
+
+// OpenSQL is used by tools/tests that need *sql.DB.
+func OpenSQL(pool *pgxpool.Pool) *sql.DB {
+	return stdlib.OpenDBFromPool(pool)
 }
