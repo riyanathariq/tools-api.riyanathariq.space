@@ -12,7 +12,8 @@ type Config struct {
 	Addr           string
 	PublicBaseURL  string
 	FrontendURL    string
-	DataDir        string
+	DatabaseURL    string
+	ValkeyURL      string
 	SessionSecret  string
 	GoogleClientID string
 	GoogleSecret   string
@@ -29,7 +30,8 @@ func Load() (Config, error) {
 		Addr:           env("HTTP_ADDR", ":3003"),
 		PublicBaseURL:  strings.TrimRight(env("PUBLIC_BASE_URL", "http://localhost:3000"), "/"),
 		FrontendURL:    strings.TrimRight(env("FRONTEND_URL", "http://localhost:3000"), "/"),
-		DataDir:        env("DATA_DIR", ".data"),
+		DatabaseURL:    env("DATABASE_URL", "postgres://tools:tools@127.0.0.1:5432/tools?sslmode=disable"),
+		ValkeyURL:      env("VALKEY_URL", "redis://127.0.0.1:6379/0"),
 		SessionSecret:  env("SESSION_SECRET", ""),
 		GoogleClientID: env("GOOGLE_CLIENT_ID", ""),
 		GoogleSecret:   env("GOOGLE_CLIENT_SECRET", ""),
@@ -51,6 +53,12 @@ func Load() (Config, error) {
 	}
 	if cfg.SessionTTL < time.Hour {
 		return Config{}, fmt.Errorf("SESSION_TTL_HOURS must be >= 1")
+	}
+	if strings.TrimSpace(cfg.DatabaseURL) == "" {
+		return Config{}, fmt.Errorf("DATABASE_URL is required")
+	}
+	if strings.TrimSpace(cfg.ValkeyURL) == "" {
+		return Config{}, fmt.Errorf("VALKEY_URL is required")
 	}
 	return cfg, nil
 }

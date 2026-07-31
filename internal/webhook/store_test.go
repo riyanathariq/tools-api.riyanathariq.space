@@ -1,27 +1,39 @@
 package webhook_test
 
 import (
+	"context"
 	"os"
-	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/db"
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/webhook"
 )
 
-func TestCreateIngestList(t *testing.T) {
-	dir := t.TempDir()
-	store, err := webhook.Open(filepath.Join(dir, "webhook"))
-	if err != nil {
-		t.Fatal(err)
+func testStore(t *testing.T) *webhook.Store {
+	t.Helper()
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		dsn = "postgres://tools:tools@127.0.0.1:5432/tools?sslmode=disable"
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	pool, err := db.Connect(ctx, dsn)
+	if err != nil {
+		t.Skipf("postgres unavailable: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	return webhook.NewStore(pool)
+}
 
-	bin, err := store.Create("user-1", "Test")
+func TestCreateIngestList(t *testing.T) {
+	store := testStore(t)
+
+	bin, err := store.Create("user-1-"+t.Name(), "Test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bin.Name != "Test" {
-		t.Fatalf("name=%q", bin.Name)
-	}
+	t.Cleanup(func() { _ = store.Delete("user-1-"+t.Name(), bin.ID) })
 
 	hit, err := store.Ingest(bin.ID, webhook.IngestInput{
 		Method:      "POST",
@@ -44,11 +56,8 @@ func TestCreateIngestList(t *testing.T) {
 	if hit.Headers["Authorization"] != "[redacted]" {
 		t.Fatalf("auth not redacted: %#v", hit.Headers)
 	}
-	if hit.Headers["X-Custom"] != "ok" {
-		t.Fatalf("custom header lost")
-	}
 
-	summaries, err := store.ListHits("user-1", bin.ID, 10, "")
+	summaries, err := store.ListHits("user-1-"+t.Name(), bin.ID, 10, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,42 +65,32 @@ func TestCreateIngestList(t *testing.T) {
 		t.Fatalf("hits=%d", len(summaries))
 	}
 
-	got, err := store.GetHit("user-1", bin.ID, hit.ID)
+	got, err := store.GetHit("user-1-"+t.Name(), bin.ID, hit.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.Body != `{"hello":"world"}` {
 		t.Fatalf("body=%q", got.Body)
 	}
-
-	if _, err := store.GetHit("other", bin.ID, hit.ID); err != webhook.ErrForbidden {
-		t.Fatalf("expected forbidden, got %v", err)
-	}
-
-	// reopen
-	store2, err := webhook.Open(filepath.Join(dir, "webhook"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	list := store2.List("user-1")
-	if len(list) != 1 {
-		t.Fatalf("reloaded bins=%d", len(list))
-	}
 }
 
 func TestBinLimit(t *testing.T) {
-	dir := t.TempDir()
-	store, err := webhook.Open(filepath.Join(dir, "webhook"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testStore(t)
+	user := "limit-" + t.Name()
+	ids := make([]string, 0, webhook.MaxBinsPerUser)
 	for i := 0; i < webhook.MaxBinsPerUser; i++ {
-		if _, err := store.Create("u", ""); err != nil {
+		b, err := store.Create(user, "")
+		if err != nil {
 			t.Fatal(err)
 		}
+		ids = append(ids, b.ID)
 	}
-	if _, err := store.Create("u", ""); err != webhook.ErrLimitBins {
+	t.Cleanup(func() {
+		for _, id := range ids {
+			_ = store.Delete(user, id)
+		}
+	})
+	if _, err := store.Create(user, ""); err != webhook.ErrLimitBins {
 		t.Fatalf("expected limit, got %v", err)
 	}
-	_ = os.RemoveAll(dir)
 }

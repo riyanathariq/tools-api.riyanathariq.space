@@ -1,22 +1,59 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tools-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-tools}
+      POSTGRES_USER: ${POSTGRES_USER:-tools}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - tools-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tools -d tools"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: tools-valkey
+    restart: unless-stopped
+    command: ["valkey-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - tools-valkey-data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   api:
     image: ${IMAGE:-ghcr.io/riyanathariq/tools-api.riyanathariq.space:latest}
     container_name: tools-api-riyanathariq
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
     ports:
       - "127.0.0.1:3003:3003"
     env_file:
       - .env
     environment:
-      - APP_ENV=production
-      - HTTP_ADDR=:3003
-      - DATA_DIR=/data
-      - COOKIE_SECURE=true
-    volumes:
-      - tools-api-data:/data
-    # distroless nonroot uid/gid = 65532; volume must be writable by that user
+      APP_ENV: production
+      HTTP_ADDR: ":3003"
+      COOKIE_SECURE: "true"
+      DATABASE_URL: postgres://${POSTGRES_USER:-tools}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-tools}?sslmode=disable
+      VALKEY_URL: redis://valkey:6379/0
     user: "65532:65532"
     pull_policy: always
 
 volumes:
-  tools-api-data:
+  tools-pg-data:
+  tools-valkey-data:

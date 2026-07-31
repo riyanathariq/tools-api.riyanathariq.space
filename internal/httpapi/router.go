@@ -1,10 +1,14 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/auth"
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/config"
@@ -19,6 +23,8 @@ type Server struct {
 	sessions *auth.SessionManager
 	limiter  *ratelimit.Limiter
 	hooks    *webhook.Store
+	pool     *pgxpool.Pool
+	rdb      *redis.Client
 	started  time.Time
 }
 
@@ -29,6 +35,8 @@ func New(
 	sessions *auth.SessionManager,
 	limiter *ratelimit.Limiter,
 	hooks *webhook.Store,
+	pool *pgxpool.Pool,
+	rdb *redis.Client,
 ) http.Handler {
 	s := &Server{
 		cfg:      cfg,
@@ -37,6 +45,8 @@ func New(
 		sessions: sessions,
 		limiter:  limiter,
 		hooks:    hooks,
+		pool:     pool,
+		rdb:      rdb,
 		started:  time.Now().UTC(),
 	}
 
@@ -60,7 +70,6 @@ func New(
 	mux.Handle("GET /api/cloud/webhook/bins/{id}/hits", s.sessions.RequireUser(http.HandlerFunc(s.handleListHits)))
 	mux.Handle("GET /api/cloud/webhook/bins/{id}/hits/{hitId}", s.sessions.RequireUser(http.HandlerFunc(s.handleGetHit)))
 
-	// Public ingest — any method, optional trailing path.
 	mux.HandleFunc("/hook/{id}", s.handleHookIngest)
 	mux.HandleFunc("/hook/{id}/{path...}", s.handleHookIngest)
 
@@ -88,6 +97,18 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		ready = false
 		reasons = append(reasons, "google_oauth_not_configured")
 	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if err := s.pool.Ping(ctx); err != nil {
+		ready = false
+		reasons = append(reasons, "postgres_unavailable")
+	}
+	if err := s.rdb.Ping(ctx).Err(); err != nil {
+		ready = false
+		reasons = append(reasons, "valkey_unavailable")
+	}
+
 	status := http.StatusOK
 	if !ready {
 		status = http.StatusServiceUnavailable

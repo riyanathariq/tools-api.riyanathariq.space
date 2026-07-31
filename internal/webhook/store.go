@@ -1,17 +1,17 @@
 package webhook
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
-	"sort"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const (
@@ -31,12 +31,12 @@ var (
 )
 
 type Bin struct {
-	ID        string    `json:"id"`
-	UserID    string    `json:"userId"`
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"createdAt"`
-	ExpiresAt time.Time `json:"expiresAt"`
-	HitCount  int       `json:"hitCount"`
+	ID        string     `json:"id"`
+	UserID    string     `json:"userId"`
+	Name      string     `json:"name"`
+	CreatedAt time.Time  `json:"createdAt"`
+	ExpiresAt time.Time  `json:"expiresAt"`
+	HitCount  int        `json:"hitCount"`
 	LastHitAt *time.Time `json:"lastHitAt,omitempty"`
 }
 
@@ -58,96 +58,22 @@ type Hit struct {
 }
 
 type HitSummary struct {
-	ID         string    `json:"id"`
-	ReceivedAt time.Time `json:"receivedAt"`
-	Method     string    `json:"method"`
-	Path       string    `json:"path"`
-	Query      string    `json:"query,omitempty"`
-	ContentType string   `json:"contentType,omitempty"`
-	BodyBytes  int       `json:"bodyBytes"`
-	IP         string    `json:"ip"`
+	ID          string    `json:"id"`
+	ReceivedAt  time.Time `json:"receivedAt"`
+	Method      string    `json:"method"`
+	Path        string    `json:"path"`
+	Query       string    `json:"query,omitempty"`
+	ContentType string    `json:"contentType,omitempty"`
+	BodyBytes   int       `json:"bodyBytes"`
+	IP          string    `json:"ip"`
 }
 
 type Store struct {
-	mu   sync.Mutex
-	dir  string
-	bins map[string]*Bin
-	// hitIDs newest-first per bin
-	order map[string][]string
+	pool *pgxpool.Pool
 }
 
-func Open(dir string) (*Store, error) {
-	if err := os.MkdirAll(filepath.Join(dir, "meta"), 0o755); err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(filepath.Join(dir, "hits"), 0o755); err != nil {
-		return nil, err
-	}
-	s := &Store{
-		dir:   dir,
-		bins:  map[string]*Bin{},
-		order: map[string][]string{},
-	}
-	if err := s.load(); err != nil {
-		return nil, err
-	}
-	s.pruneExpiredLocked(time.Now().UTC())
-	return s, nil
-}
-
-func (s *Store) load() error {
-	entries, err := os.ReadDir(filepath.Join(s.dir, "meta"))
-	if err != nil {
-		return err
-	}
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			continue
-		}
-		raw, err := os.ReadFile(filepath.Join(s.dir, "meta", e.Name()))
-		if err != nil {
-			continue
-		}
-		var b Bin
-		if err := json.Unmarshal(raw, &b); err != nil {
-			continue
-		}
-		s.bins[b.ID] = &b
-		s.order[b.ID] = s.listHitIDs(b.ID)
-	}
-	return nil
-}
-
-func (s *Store) listHitIDs(binID string) []string {
-	dir := filepath.Join(s.dir, "hits", binID)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil
-	}
-	type item struct {
-		id string
-		t  time.Time
-	}
-	items := make([]item, 0, len(entries))
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			continue
-		}
-		id := strings.TrimSuffix(e.Name(), ".json")
-		h, err := s.readHitFile(binID, id)
-		if err != nil {
-			continue
-		}
-		items = append(items, item{id: id, t: h.ReceivedAt})
-	}
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].t.After(items[j].t)
-	})
-	out := make([]string, len(items))
-	for i, it := range items {
-		out[i] = it.id
-	}
-	return out
+func NewStore(pool *pgxpool.Pool) *Store {
+	return &Store{pool: pool}
 }
 
 func newID() (string, error) {
@@ -159,16 +85,15 @@ func newID() (string, error) {
 }
 
 func (s *Store) Create(userID, name string) (*Bin, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := time.Now().UTC()
-	s.pruneExpiredLocked(now)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.pruneExpired(ctx); err != nil {
+		return nil, err
+	}
 
-	count := 0
-	for _, b := range s.bins {
-		if b.UserID == userID {
-			count++
-		}
+	var count int
+	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM webhook_bins WHERE user_id = $1`, userID).Scan(&count); err != nil {
+		return nil, err
 	}
 	if count >= MaxBinsPerUser {
 		return nil, ErrLimitBins
@@ -185,6 +110,7 @@ func (s *Store) Create(userID, name string) (*Bin, error) {
 	if len(name) > 64 {
 		name = name[:64]
 	}
+	now := time.Now().UTC()
 	bin := &Bin{
 		ID:        id,
 		UserID:    userID,
@@ -193,76 +119,84 @@ func (s *Store) Create(userID, name string) (*Bin, error) {
 		ExpiresAt: now.Add(BinTTL),
 		HitCount:  0,
 	}
-	if err := s.writeBinLocked(bin); err != nil {
+	_, err = s.pool.Exec(ctx, `
+		INSERT INTO webhook_bins (id, user_id, name, created_at, expires_at, hit_count)
+		VALUES ($1, $2, $3, $4, $5, 0)
+	`, bin.ID, bin.UserID, bin.Name, bin.CreatedAt, bin.ExpiresAt)
+	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Join(s.dir, "hits", id), 0o755); err != nil {
-		return nil, err
-	}
-	s.bins[id] = bin
-	s.order[id] = nil
-	cp := *bin
-	return &cp, nil
+	return bin, nil
 }
 
 func (s *Store) List(userID string) []Bin {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := time.Now().UTC()
-	s.pruneExpiredLocked(now)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = s.pruneExpired(ctx)
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, user_id, name, created_at, expires_at, hit_count, last_hit_at
+		FROM webhook_bins
+		WHERE user_id = $1
+		ORDER BY created_at DESC
+	`, userID)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
 
 	out := make([]Bin, 0)
-	for _, b := range s.bins {
-		if b.UserID == userID {
-			out = append(out, *b)
+	for rows.Next() {
+		b, err := scanBin(rows)
+		if err != nil {
+			continue
 		}
+		out = append(out, b)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].CreatedAt.After(out[j].CreatedAt)
-	})
 	return out
 }
 
 func (s *Store) Get(userID, binID string) (*Bin, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := time.Now().UTC()
-	s.pruneExpiredLocked(now)
-	b, err := s.getOwnedLocked(userID, binID)
-	if err != nil {
-		return nil, err
-	}
-	cp := *b
-	return &cp, nil
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = s.pruneExpired(ctx)
+	return s.getOwned(ctx, userID, binID)
 }
 
 func (s *Store) Delete(userID, binID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	b, err := s.getOwnedLocked(userID, binID)
-	if err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := s.getOwned(ctx, userID, binID); err != nil {
 		return err
 	}
-	return s.deleteBinLocked(b.ID)
+	_, err := s.pool.Exec(ctx, `DELETE FROM webhook_bins WHERE id = $1`, binID)
+	return err
 }
 
 func (s *Store) ClearHits(userID, binID string) (*Bin, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	b, err := s.getOwnedLocked(userID, binID)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := s.getOwned(ctx, userID, binID); err != nil {
+		return nil, err
+	}
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
-	_ = os.RemoveAll(filepath.Join(s.dir, "hits", binID))
-	_ = os.MkdirAll(filepath.Join(s.dir, "hits", binID), 0o755)
-	s.order[binID] = nil
-	b.HitCount = 0
-	b.LastHitAt = nil
-	if err := s.writeBinLocked(b); err != nil {
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, `DELETE FROM webhook_hits WHERE bin_id = $1`, binID); err != nil {
 		return nil, err
 	}
-	cp := *b
-	return &cp, nil
+	if _, err := tx.Exec(ctx, `
+		UPDATE webhook_bins SET hit_count = 0, last_hit_at = NULL WHERE id = $1
+	`, binID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return s.getOwned(ctx, userID, binID)
 }
 
 type IngestInput struct {
@@ -278,17 +212,21 @@ type IngestInput struct {
 }
 
 func (s *Store) Ingest(binID string, in IngestInput) (*Hit, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := time.Now().UTC()
-	s.pruneExpiredLocked(now)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	_ = s.pruneExpired(ctx)
 
-	b, ok := s.bins[binID]
-	if !ok {
+	var expiresAt time.Time
+	err := s.pool.QueryRow(ctx, `SELECT expires_at FROM webhook_bins WHERE id = $1`, binID).Scan(&expiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
-	if now.After(b.ExpiresAt) {
-		_ = s.deleteBinLocked(binID)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	if now.After(expiresAt) {
+		_, _ = s.pool.Exec(ctx, `DELETE FROM webhook_bins WHERE id = $1`, binID)
 		return nil, ErrExpired
 	}
 
@@ -303,6 +241,13 @@ func (s *Store) Ingest(binID string, in IngestInput) (*Hit, error) {
 	if err != nil {
 		return nil, err
 	}
+	if in.QueryParams == nil {
+		in.QueryParams = map[string]string{}
+	}
+	headers := redactHeaders(in.Headers)
+	qpJSON, _ := json.Marshal(in.QueryParams)
+	hJSON, _ := json.Marshal(headers)
+
 	hit := &Hit{
 		ID:          hitID,
 		BinID:       binID,
@@ -311,7 +256,7 @@ func (s *Store) Ingest(binID string, in IngestInput) (*Hit, error) {
 		Path:        in.Path,
 		Query:       in.RawQuery,
 		QueryParams: in.QueryParams,
-		Headers:     redactHeaders(in.Headers),
+		Headers:     headers,
 		ContentType: in.ContentType,
 		Body:        string(body),
 		BodyTrunc:   trunc,
@@ -319,171 +264,201 @@ func (s *Store) Ingest(binID string, in IngestInput) (*Hit, error) {
 		IP:          in.IP,
 		UserAgent:   in.UserAgent,
 	}
-	if err := s.writeHitLocked(hit); err != nil {
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	_, err = tx.Exec(ctx, `
+		INSERT INTO webhook_hits (
+			id, bin_id, received_at, method, path, query, query_params, headers,
+			content_type, body, body_truncated, body_bytes, ip, user_agent
+		) VALUES (
+			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14
+		)
+	`, hit.ID, hit.BinID, hit.ReceivedAt, hit.Method, hit.Path, hit.Query, qpJSON, hJSON,
+		hit.ContentType, hit.Body, hit.BodyTrunc, hit.BodyBytes, hit.IP, hit.UserAgent)
+	if err != nil {
 		return nil, err
 	}
 
-	order := append([]string{hitID}, s.order[binID]...)
-	for len(order) > MaxHitsPerBin {
-		old := order[len(order)-1]
-		order = order[:len(order)-1]
-		_ = os.Remove(filepath.Join(s.dir, "hits", binID, old+".json"))
-	}
-	s.order[binID] = order
-	b.HitCount = len(order)
-	t := now
-	b.LastHitAt = &t
-	if err := s.writeBinLocked(b); err != nil {
+	// Cap to newest MaxHitsPerBin.
+	_, err = tx.Exec(ctx, `
+		DELETE FROM webhook_hits
+		WHERE bin_id = $1
+		  AND id IN (
+			SELECT id FROM webhook_hits
+			WHERE bin_id = $1
+			ORDER BY received_at DESC
+			OFFSET $2
+		  )
+	`, binID, MaxHitsPerBin)
+	if err != nil {
 		return nil, err
 	}
-	cp := *hit
-	return &cp, nil
+
+	var hitCount int
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM webhook_hits WHERE bin_id = $1`, binID).Scan(&hitCount); err != nil {
+		return nil, err
+	}
+	_, err = tx.Exec(ctx, `
+		UPDATE webhook_bins SET hit_count = $2, last_hit_at = $3 WHERE id = $1
+	`, binID, hitCount, now)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return hit, nil
 }
 
 func (s *Store) ListHits(userID, binID string, limit int, after string) ([]HitSummary, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := time.Now().UTC()
-	s.pruneExpiredLocked(now)
-	if _, err := s.getOwnedLocked(userID, binID); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := s.getOwned(ctx, userID, binID); err != nil {
 		return nil, err
 	}
 	if limit <= 0 || limit > MaxHitsPerBin {
 		limit = MaxHitsPerBin
 	}
-	order := s.order[binID]
+
+	var rows pgx.Rows
+	var err error
+	if after == "" {
+		rows, err = s.pool.Query(ctx, `
+			SELECT id, received_at, method, path, query, content_type, body_bytes, ip
+			FROM webhook_hits
+			WHERE bin_id = $1
+			ORDER BY received_at DESC
+			LIMIT $2
+		`, binID, limit)
+	} else {
+		rows, err = s.pool.Query(ctx, `
+			SELECT id, received_at, method, path, query, content_type, body_bytes, ip
+			FROM webhook_hits
+			WHERE bin_id = $1
+			  AND received_at < (
+				SELECT received_at FROM webhook_hits WHERE id = $2 AND bin_id = $1
+			  )
+			ORDER BY received_at DESC
+			LIMIT $3
+		`, binID, after, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
 	out := make([]HitSummary, 0, limit)
-	skip := after != ""
-	for _, id := range order {
-		if skip {
-			if id == after {
-				skip = false
-			}
+	for rows.Next() {
+		var h HitSummary
+		if err := rows.Scan(&h.ID, &h.ReceivedAt, &h.Method, &h.Path, &h.Query, &h.ContentType, &h.BodyBytes, &h.IP); err != nil {
 			continue
 		}
-		h, err := s.readHitFile(binID, id)
-		if err != nil {
-			continue
-		}
-		out = append(out, HitSummary{
-			ID:          h.ID,
-			ReceivedAt:  h.ReceivedAt,
-			Method:      h.Method,
-			Path:        h.Path,
-			Query:       h.Query,
-			ContentType: h.ContentType,
-			BodyBytes:   h.BodyBytes,
-			IP:          h.IP,
-		})
-		if len(out) >= limit {
-			break
-		}
+		out = append(out, h)
 	}
 	return out, nil
 }
 
 func (s *Store) GetHit(userID, binID, hitID string) (*Hit, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := time.Now().UTC()
-	s.pruneExpiredLocked(now)
-	if _, err := s.getOwnedLocked(userID, binID); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := s.getOwned(ctx, userID, binID); err != nil {
 		return nil, err
 	}
-	h, err := s.readHitFile(binID, hitID)
-	if err != nil {
+
+	var (
+		h       Hit
+		qpRaw   []byte
+		hdrRaw  []byte
+	)
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, bin_id, received_at, method, path, query, query_params, headers,
+		       content_type, body, body_truncated, body_bytes, ip, user_agent
+		FROM webhook_hits
+		WHERE id = $1 AND bin_id = $2
+	`, hitID, binID).Scan(
+		&h.ID, &h.BinID, &h.ReceivedAt, &h.Method, &h.Path, &h.Query, &qpRaw, &hdrRaw,
+		&h.ContentType, &h.Body, &h.BodyTrunc, &h.BodyBytes, &h.IP, &h.UserAgent,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
-	return h, nil
+	if err != nil {
+		return nil, err
+	}
+	_ = json.Unmarshal(qpRaw, &h.QueryParams)
+	_ = json.Unmarshal(hdrRaw, &h.Headers)
+	if h.QueryParams == nil {
+		h.QueryParams = map[string]string{}
+	}
+	if h.Headers == nil {
+		h.Headers = map[string]string{}
+	}
+	return &h, nil
 }
 
 func (s *Store) PublicExists(binID string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := time.Now().UTC()
-	s.pruneExpiredLocked(now)
-	b, ok := s.bins[binID]
-	return ok && now.Before(b.ExpiresAt)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_ = s.pruneExpired(ctx)
+	var expiresAt time.Time
+	err := s.pool.QueryRow(ctx, `SELECT expires_at FROM webhook_bins WHERE id = $1`, binID).Scan(&expiresAt)
+	if err != nil {
+		return false
+	}
+	return time.Now().UTC().Before(expiresAt)
 }
 
-func (s *Store) getOwnedLocked(userID, binID string) (*Bin, error) {
-	b, ok := s.bins[binID]
-	if !ok {
+func (s *Store) getOwned(ctx context.Context, userID, binID string) (*Bin, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT id, user_id, name, created_at, expires_at, hit_count, last_hit_at
+		FROM webhook_bins WHERE id = $1
+	`, binID)
+	b, err := scanBin(row)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
 	}
 	if b.UserID != userID {
 		return nil, ErrForbidden
 	}
 	if time.Now().UTC().After(b.ExpiresAt) {
-		_ = s.deleteBinLocked(binID)
+		_, _ = s.pool.Exec(ctx, `DELETE FROM webhook_bins WHERE id = $1`, binID)
 		return nil, ErrExpired
 	}
+	return &b, nil
+}
+
+type scannable interface {
+	Scan(dest ...any) error
+}
+
+func scanBin(row scannable) (Bin, error) {
+	var b Bin
+	var lastHit *time.Time
+	err := row.Scan(&b.ID, &b.UserID, &b.Name, &b.CreatedAt, &b.ExpiresAt, &b.HitCount, &lastHit)
+	if err != nil {
+		return Bin{}, err
+	}
+	b.LastHitAt = lastHit
 	return b, nil
 }
 
-func (s *Store) writeBinLocked(b *Bin) error {
-	raw, err := json.MarshalIndent(b, "", "  ")
-	if err != nil {
-		return err
-	}
-	path := filepath.Join(s.dir, "meta", b.ID+".json")
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
-
-func (s *Store) writeHitLocked(h *Hit) error {
-	dir := filepath.Join(s.dir, "hits", h.BinID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	raw, err := json.MarshalIndent(h, "", "  ")
-	if err != nil {
-		return err
-	}
-	path := filepath.Join(dir, h.ID+".json")
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
-
-func (s *Store) readHitFile(binID, hitID string) (*Hit, error) {
-	raw, err := os.ReadFile(filepath.Join(s.dir, "hits", binID, hitID+".json"))
-	if err != nil {
-		return nil, err
-	}
-	var h Hit
-	if err := json.Unmarshal(raw, &h); err != nil {
-		return nil, err
-	}
-	return &h, nil
-}
-
-func (s *Store) deleteBinLocked(binID string) error {
-	delete(s.bins, binID)
-	delete(s.order, binID)
-	_ = os.Remove(filepath.Join(s.dir, "meta", binID+".json"))
-	_ = os.RemoveAll(filepath.Join(s.dir, "hits", binID))
-	return nil
-}
-
-func (s *Store) pruneExpiredLocked(now time.Time) {
-	for id, b := range s.bins {
-		if now.After(b.ExpiresAt) {
-			_ = s.deleteBinLocked(id)
-		}
-	}
+func (s *Store) pruneExpired(ctx context.Context) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM webhook_bins WHERE expires_at < NOW()`)
+	return err
 }
 
 func redactHeaders(in map[string]string) map[string]string {
 	out := make(map[string]string, len(in))
 	for k, v := range in {
-		lk := strings.ToLower(k)
-		switch lk {
+		switch strings.ToLower(k) {
 		case "authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key", "x-auth-token":
 			out[k] = "[redacted]"
 		default:

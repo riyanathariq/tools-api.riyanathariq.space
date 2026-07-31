@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -15,6 +14,7 @@ import (
 
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/auth"
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/config"
+	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/db"
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/httpapi"
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/ratelimit"
 	"github.com/riyanathariq/tools-api.riyanathariq.space/internal/webhook"
@@ -31,6 +31,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	bootCtx, bootCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer bootCancel()
+
+	pool, err := db.Connect(bootCtx, cfg.DatabaseURL)
+	if err != nil {
+		log.Error("postgres", "err", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	rdb, err := ratelimit.ConnectValkey(bootCtx, cfg.ValkeyURL)
+	if err != nil {
+		log.Error("valkey", "err", err)
+		os.Exit(1)
+	}
+	defer rdb.Close()
+
 	sessions := auth.NewSessionManager(cfg.SessionSecret, cfg.CookieName, cfg.CookieSecure, cfg.SessionTTL)
 	google := auth.NewGoogleAuth(
 		cfg.GoogleClientID,
@@ -41,24 +58,15 @@ func main() {
 		log,
 	)
 
-	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
-		log.Error("data dir", "err", err)
-		os.Exit(1)
-	}
-	hooks, err := webhook.Open(filepath.Join(cfg.DataDir, "webhook"))
-	if err != nil {
-		log.Error("webhook store", "err", err)
-		os.Exit(1)
-	}
-
-	limiter := ratelimit.New()
-	handler := httpapi.New(cfg, log, google, sessions, limiter, hooks)
+	hooks := webhook.NewStore(pool)
+	limiter := ratelimit.New(rdb)
+	handler := httpapi.New(cfg, log, google, sessions, limiter, hooks, pool, rdb)
 	server := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       20 * time.Second,
-		WriteTimeout:      45 * time.Second, // SMTP tests can take a while
+		WriteTimeout:      45 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 
@@ -68,6 +76,8 @@ func main() {
 			"env", cfg.Env,
 			"google_configured", google.Enabled(),
 			"public_base_url", cfg.PublicBaseURL,
+			"postgres", true,
+			"valkey", true,
 		)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("server failed", "err", err)
