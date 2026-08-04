@@ -1,6 +1,9 @@
 package smtp
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestLooksLikeEmail(t *testing.T) {
 	ok := []string{"a@b.co", "user.name+tag@example.com"}
@@ -21,5 +24,16 @@ func TestRunTestValidation(t *testing.T) {
 	res := RunTest(Request{})
 	if res.OK || res.Error == "" {
 		t.Fatalf("expected validation failure, got %+v", res)
+	}
+}
+
+func TestCheckAuthValidation(t *testing.T) {
+	res := CheckAuth(AuthCheckRequest{})
+	if res.OK || res.Error == "" {
+		t.Fatalf("expected validation failure, got %+v", res)
+	}
+	res = CheckAuth(AuthCheckRequest{Host: "smtp.example.com", Port: 587, Username: "u"})
+	if res.OK || !strings.Contains(strings.ToLower(res.Error), "password") {
+		t.Fatalf("expected password required, got %+v", res)
 	}
 }

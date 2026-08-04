@@ -71,6 +71,7 @@ func New(
 	mux.HandleFunc("POST /api/events/visitor", s.handleVisitorEvent)
 
 	mux.Handle("POST /api/cloud/smtp/test", s.RequireActiveUser(http.HandlerFunc(s.handleSMTPTest)))
+	mux.Handle("POST /api/cloud/smtp/check-auth", s.RequireActiveUser(http.HandlerFunc(s.handleSMTPCheckAuth)))
 
 	mux.Handle("GET /api/cloud/webhook/bins", s.RequireActiveUser(http.HandlerFunc(s.handleListBins)))
 	mux.Handle("POST /api/cloud/webhook/bins", s.RequireActiveUser(http.HandlerFunc(s.handleCreateBin)))
